@@ -1,6 +1,7 @@
 # Slackbase
 
 Slackbase is a key-value store database engine.
+
 Note that I made this project as a way to learn Rust so it's not meant to be serious (hence why I call it "slack"-base) however I'm always open for feedbacks and suggestions.
 
 ## Features
