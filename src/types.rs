@@ -1,4 +1,13 @@
 pub type Result<T> = std::result::Result<T, Error>;
+use serde::{Serialize, Deserialize};
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptMeta {
+    pub name: String,
+    pub sha1: String,
+    pub desc: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum Error {

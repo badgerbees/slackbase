@@ -11,3 +11,5 @@ mlua = { version = "0.9", default-features = false, features = ["lua54", "vendor
 sha1 = "0.10"
 hex  = "0.4"
 prettytable = "0.10"
+serde = { version = "1.0.219", features = ["derive"] }
+lru = "0.16.0"

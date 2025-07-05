@@ -27,7 +27,7 @@ impl WAL {
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }
-
+   
     /// Re-read all records for recovery.
     pub fn iter(&self) -> std::io::Result<Vec<String>> {
         let file = File::open(&self.path)?;

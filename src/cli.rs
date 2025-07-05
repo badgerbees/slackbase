@@ -3,6 +3,8 @@ use crate::serialization::plain::PlainSerializer;
 use crate::serialization::json::JsonSerializer;
 use crate::serialization::Serializer;
 use crate::engine::batch::BatchOp;
+use crate::script::ScriptManager;
+use crate::logging::print_lua_value;
 
 use std::io::{ self, Write };
 use std::sync::{ Arc, Mutex };
@@ -107,6 +109,19 @@ pub fn run() {
                 println!("Database restored from {}", filename);
             }
 
+            ["find", field, value] => {
+                let engine = db.lock().unwrap();
+                let keys = engine.sec_index.find(field, value);
+                if keys.is_empty() {
+                    println!("No keys found with {} = {}", field, value);
+                } else {
+                    println!("Keys with {} = {}:", field, value);
+                    for k in keys {
+                        println!("- {}", k);
+                    }
+                }
+            }
+
             ["batch", tail @ ..] => {
                 let mut ops = Vec::new();
                 let mut iter = tail.iter();
@@ -167,7 +182,8 @@ pub fn run() {
             ["eval", tail @ ..] => {
                 let src = tail.join(" ");
                 let mut engine = db.lock().unwrap();
-                match engine.eval_register(&src) {
+                // Add name/desc as needed, or use None for now
+                match engine.eval_register(&src, None, None) {
                     Ok(sha) => println!("Script cached, SHA1={}", sha),
                     Err(e) => println!("Error compiling script: {:?}", e),
                 }
@@ -180,51 +196,7 @@ pub fn run() {
                 let args = split.next().unwrap_or(&[]).to_vec();
                 let mut engine = db.lock().unwrap();
                 match engine.eval_sha(sha, &keys, &args) {
-                    Ok(val) => {
-                        match val {
-                            mlua::Value::Table(t) => {
-                                let mut table = Table::new();
-                                table.add_row(Row::new(vec![Cell::new("Idx"), Cell::new("Value")]));
-                                let mut idx = 1;
-                                loop {
-                                    match t.get::<_, mlua::Value>(idx) {
-                                        Ok(mlua::Value::Nil) | Err(_) => {
-                                            break;
-                                        }
-                                        Ok(v) => {
-                                            let s = match v {
-                                                mlua::Value::String(s) =>
-                                                    s.to_str().unwrap_or("").to_string(),
-                                                mlua::Value::Number(n) => n.to_string(),
-                                                mlua::Value::Boolean(b) => b.to_string(),
-                                                mlua::Value::Table(_) => "[table]".to_string(),
-                                                mlua::Value::Nil => "null".to_string(),
-                                                _ => "unsupported".to_string(),
-                                            };
-                                            table.add_row(
-                                                Row::new(
-                                                    vec![Cell::new(&idx.to_string()), Cell::new(&s)]
-                                                )
-                                            );
-                                        }
-                                    }
-                                    idx += 1;
-                                }
-                                table.printstd();
-                            }
-                            v => {
-                                // Print single value nicely
-                                let pretty = match v {
-                                    mlua::Value::String(s) => s.to_str().unwrap_or("").to_string(),
-                                    mlua::Value::Number(n) => n.to_string(),
-                                    mlua::Value::Boolean(b) => b.to_string(),
-                                    mlua::Value::Nil => "null".to_string(),
-                                    _ => format!("{:?}", v),
-                                };
-                                println!("Result: {}", pretty);
-                            }
-                        }
-                    }
+                    Ok(val) => print_lua_value(&val),
                     Err(e) => {
                         use mlua::Error as LuaError;
                         match &e {
@@ -259,75 +231,215 @@ pub fn run() {
                     }
                 }
             }
-            ["script", "load", filename] => {
-                // Always search inside ./lua_scripts/
-                let mut path = std::path::PathBuf::from("lua_scripts");
-                path.push(filename);
-
-                let mut file = std::fs::File
-                    ::open(&path)
-                    .unwrap_or_else(|_| panic!("Cannot open script file: {}", path.display()));
-                let mut src = String::new();
-                use std::io::Read;
-                file.read_to_string(&mut src).expect("Cannot read script file");
+            ["script", "load", filename, name, desc @ ..] => {
+                let script_desc = if desc.is_empty() { None } else { Some(desc.join(" ")) };
                 let mut engine = db.lock().unwrap();
-                match engine.eval_register(&src) {
-                    Ok(sha) => println!("Script cached, SHA1={}", sha),
+                let mut manager = ScriptManager::new(&mut engine);
+                match manager.load_script_from_file(filename, name, script_desc.as_deref()) {
+                    Ok(sha) => println!("Script '{}' cached, SHA1={}", name, sha),
                     Err(e) => println!("Error compiling script: {:?}", e),
                 }
             }
 
-            ["script", "begin"] => {
-                println!("Enter Lua script. End with a line containing only END:");
-                let mut src = String::new();
-                loop {
-                    let mut line = String::new();
-                    std::io::stdin().read_line(&mut line).unwrap();
-                    if line.trim() == "END" {
-                        break;
-                    }
-                    src.push_str(&line);
-                }
+            ["script", "begin", name, desc @ ..] => {
+                let script_desc = if desc.is_empty() { None } else { Some(desc.join(" ")) };
                 let mut engine = db.lock().unwrap();
-                match engine.eval_register(&src) {
-                    Ok(sha) => println!("Script cached, SHA1={}", sha),
+                let mut manager = ScriptManager::new(&mut engine);
+                match manager.begin_script_interactive(name, script_desc.as_deref()) {
+                    Ok(sha) => println!("Script '{}' cached, SHA1={}", name, sha),
                     Err(e) => println!("Error compiling script: {:?}", e),
                 }
             }
+
             ["script", "list"] => {
-                let engine = db.lock().unwrap();
-                let list = engine.list_scripts();
-                for sha in list {
-                    println!("{}", sha);
-                }
-            }
-            ["script", "run", sha, tail @ ..] => {
-                // Syntax: script run <sha> key1 key2 ... -- arg1 arg2 ...
-                let mut split = tail.split(|&s| s == "--");
-                let keys = split.next().unwrap_or(&[]).to_vec();
-                let args = split.next().unwrap_or(&[]).to_vec();
                 let mut engine = db.lock().unwrap();
-                match engine.eval_sha(sha, &keys, &args) {
-                    Ok(val) =>
-                        match val {
-                            mlua::Value::Table(t) => {
-                                let mut vec = Vec::new();
-                                let mut idx = 1;
-                                loop {
-                                    match t.get::<_, mlua::Value>(idx) {
-                                        Ok(mlua::Value::Nil) | Err(_) => {
-                                            break;
-                                        }
-                                        Ok(v) => vec.push(format!("{:?}", v)),
-                                    }
-                                    idx += 1;
-                                }
-                                println!("Result: [{}]", vec.join(", "));
-                            }
-                            v => println!("Result: {:?}", v),
-                        }
+                let manager = ScriptManager::new(&mut engine);
+                let scripts = manager.list_scripts();
+                let mut table = Table::new();
+                table.add_row(
+                    Row::new(vec![Cell::new("SHA1"), Cell::new("Name"), Cell::new("Description")])
+                );
+                for meta in scripts {
+                    table.add_row(
+                        Row::new(
+                            vec![
+                                Cell::new(&meta.sha1),
+                                Cell::new(&meta.name),
+                                Cell::new(meta.desc.as_deref().unwrap_or(""))
+                            ]
+                        )
+                    );
+                }
+                table.printstd();
+            }
+
+            ["script", "run", sha_or_name, tail @ ..] => {
+                let mut split = tail.split(|&s| s == "--");
+                let keys: Vec<String> = split
+                    .next()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let args: Vec<String> = split
+                    .next()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let mut engine = db.lock().unwrap();
+                let mut manager = ScriptManager::new(&mut engine);
+                match manager.run_script(sha_or_name, &keys, &args) {
+                    Ok(val) => print_lua_value(&val),
                     Err(e) => println!("Error running script: {:?}", e),
                 }
+            }
+
+            ["script", "rename", old_name, new_name] => {
+                let mut engine = db.lock().unwrap();
+                let mut manager = ScriptManager::new(&mut engine);
+                match manager.rename_script(old_name, new_name) {
+                    Ok(()) => println!("Script '{}' renamed to '{}'", old_name, new_name),
+                    Err(_) => println!("Script name '{}' not found", old_name),
+                }
+            }
+            ["script", "remove", sha_or_name] => {
+                let mut engine = db.lock().unwrap();
+                let mut manager = ScriptManager::new(&mut engine);
+                match manager.remove_script(sha_or_name) {
+                    Ok(()) => println!("Script '{}' removed.", sha_or_name),
+                    Err(_) => println!("Script '{}' not found.", sha_or_name),
+                }
+            }
+
+            // JSON commands
+
+            ["json", "set", key, field, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.json_set_field(key, field, value) {
+                    Ok(_) => println!("OK"),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+
+            ["json", "get", key, field] => {
+                let mut engine = db.lock().unwrap();
+                match engine.json_get_field(key, field) {
+                    Some(val) => println!("{}", val),
+                    None => println!("(nil)"),
+                }
+            }
+            ["list", "push", key, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.list_push(key, value) {
+                    Ok(_) => println!("OK (pushed '{}' to list '{}')", value, key),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+
+            ["list", "show", key] | ["set", "show", key] => {
+                let mut engine = db.lock().unwrap();
+                match engine.get(key) {
+                    Some(val) => println!("{}", val),
+                    None => println!("(nil)"),
+                }
+            }
+
+            ["set", "add", key, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.set_add(key, value) {
+                    Ok(_) => println!("OK (added '{}' to set '{}')", value, key),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+
+            // Hash JSON commands
+            // Set field in a hash (JSON object)
+            ["hash", "set", key, field, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.hash_set(key, field, value) {
+                    Ok(_) => println!("OK (set '{}:{}')", key, field),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+
+            // Get field from a hash
+            ["hash", "get", key, field] => {
+                let mut engine = db.lock().unwrap();
+                match engine.hash_get(key, field) {
+                    Some(val) => println!("{}", val),
+                    None => println!("(nil)"),
+                }
+            }
+
+            // Delete field from a hash
+            ["hash", "del", key, field] => {
+                let mut engine = db.lock().unwrap();
+                match engine.hash_del(key, field) {
+                    Ok(_) => println!("OK (deleted '{}:{}')", key, field),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+
+            // Get all fields/values from a hash
+            ["hash", "getall", key] => {
+                let mut engine = db.lock().unwrap();
+                match engine.hash_getall(key) {
+                    Some(map) => {
+                        for (k, v) in map {
+                            println!("{}: {}", k, v);
+                        }
+                    }
+                    None => println!("(nil)"),
+                }
+            }
+
+            // List commands
+            ["list", "lpush", key, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.list_lpush(key, value) {
+                    Ok(_) => println!("OK (lpush '{}' to '{}')", value, key),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+            ["list", "rpush", key, value] => {
+                let mut engine = db.lock().unwrap();
+                match engine.list_rpush(key, value) {
+                    Ok(_) => println!("OK (rpush '{}' to '{}')", value, key),
+                    Err(e) => println!("ERR: {:?}", e),
+                }
+            }
+            ["list", "lpop", key] => {
+                let mut engine = db.lock().unwrap();
+                match engine.list_lpop(key) {
+                    Some(val) => println!("{}", val),
+                    None => println!("(nil)"),
+                }
+            }
+            ["list", "rpop", key] => {
+                let mut engine = db.lock().unwrap();
+                match engine.list_rpop(key) {
+                    Some(val) => println!("{}", val),
+                    None => println!("(nil)"),
+                }
+            }
+            ["list", "range", key, start, end] => {
+                let mut engine = db.lock().unwrap();
+                let s = start.parse().unwrap_or(0);
+                let e = end.parse().unwrap_or(0);
+                match engine.list_range(key, s, e) {
+                    Some(items) if !items.is_empty() => {
+                        for item in items {
+                            println!("{}", item);
+                        }
+                    }
+                    _ => println!("(nil)"),
+                }
+            }
+            ["list", "len", key] => {
+                let mut engine = db.lock().unwrap();
+                let len = engine.list_len(key);
+                println!("{}", len);
             }
 
             ["exit"] | ["quit"] => {
