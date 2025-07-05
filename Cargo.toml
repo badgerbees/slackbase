@@ -1,0 +1,13 @@
+[package]
+name = "slackbase"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.1"
+memmap2 = "0.9.5"
+serde_json = "1.0.140"
+mlua = { version = "0.9", default-features = false, features = ["lua54", "vendored"] }
+sha1 = "0.10"
+hex  = "0.4"
+prettytable = "0.10"
